@@ -72,12 +72,17 @@ class COCOSegmentDataset(Dataset):
                 self.img_to_anns[img_id] = []
             self.img_to_anns[img_id].append(ann)
 
-        # Load categories
-        self.categories = {cat['id']: cat['name'] for cat in self.coco_data['categories']}
+        # Load categories - use supercategory if available (matches training prompts)
+        self.categories = {}
+        self.category_names = {}
+        for cat in self.coco_data['categories']:
+            self.categories[cat['id']] = cat.get('supercategory', cat['name'])
+            self.category_names[cat['id']] = cat['name']
         print(f"Loaded COCO dataset: {split} split")
         print(f"  Images: {len(self.image_ids)}")
         print(f"  Annotations: {len(self.coco_data['annotations'])}")
-        print(f"  Categories: {self.categories}")
+        print(f"  Categories (supercategory used for prompts): {self.categories}")
+        print(f"  Category names (for reference): {self.category_names}")
 
         self.resolution = 1008
         self.transform = v2.Compose([
@@ -816,7 +821,8 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
     model = build_sam3_image_model(
         device=device.type,
         compile=False,
-        load_from_HF=True,
+        load_from_HF=False,
+        checkpoint_path="/mnt/d/projects/specific/sam3/sam3/sam3.pt",
         bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
         eval_mode=False
     )
@@ -903,12 +909,17 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
                     self.img_to_anns[img_id] = []
                 self.img_to_anns[img_id].append(ann)
 
-            # Load categories
-            self.categories = {cat['id']: cat['name'] for cat in self.coco_data['categories']}
+            # Load categories - use supercategory if available (matches training prompts)
+            self.categories = {}
+            self.category_names = {}
+            for cat in self.coco_data['categories']:
+                self.categories[cat['id']] = cat.get('supercategory', cat['name'])
+                self.category_names[cat['id']] = cat['name']
             print(f"Loaded COCO dataset from {data_dir}")
             print(f"  Images: {len(self.image_ids)}")
             print(f"  Annotations: {len(self.coco_data['annotations'])}")
-            print(f"  Categories: {self.categories}")
+            print(f"  Categories (supercategory used for prompts): {self.categories}")
+            print(f"  Category names (for reference): {self.category_names}")
 
             self.resolution = 1008
             self.transform = v2.Compose([
@@ -948,20 +959,26 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
     all_image_ids = []
     val_losses = []
 
+    # Track image index correctly across batches.
+    # SAM3 outputs queries per image (not 1:1 with batch items),
+    # so we track the actual number of images processed.
+    running_img_idx = 0
+
     # Use automatic mixed precision for faster inference
     use_amp = device.type == 'cuda'
 
     with torch.no_grad():
         for batch_idx, batch_dict in enumerate(tqdm(val_loader, desc="Validation")):
-            if num_samples and batch_idx * batch_size >= num_samples:
+            if num_samples and running_img_idx >= num_samples:
                 break
 
             input_batch = batch_dict["input"]
+            actual_batch_images = len(batch_dict["image_ids"]) if "image_ids" in batch_dict else batch_size
             input_batch = move_to_device(input_batch, device)
 
             # Forward pass with optional AMP
             if use_amp:
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     outputs_list = model(input_batch)
             else:
                 outputs_list = model(input_batch)
@@ -973,10 +990,18 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
                 final_stage = list(outputs_iter)[-1]
                 final_outputs = final_stage[-1]
 
-                batch_size_actual = final_outputs['pred_logits'].shape[0]
+                # SAM3 pred_logits shape: [num_queries, num_preds, 1]
+                # where num_queries = batch_size * num_categories_per_image
+                # We need to map each prediction back to its source image.
+                # Use actual_batch_images (number of real images in this batch)
+                # and clamp to avoid exceeding dataset size.
+                num_preds = final_outputs['pred_logits'].shape[0]
+                remaining = len(val_ds) - running_img_idx
+                num_images_this_batch = min(actual_batch_images, remaining, num_preds)
 
-                for i in range(batch_size_actual):
-                    img_id = batch_idx * batch_size + i
+                for i in range(num_images_this_batch):
+                    img_id = running_img_idx
+                    running_img_idx += 1
                     all_image_ids.append(img_id)
                     all_predictions.append({
                         'pred_logits': final_outputs['pred_logits'][i].detach().cpu(),
@@ -992,10 +1017,16 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
     print("="*80)
 
     # Create COCO ground truth (downsampled to 288×288 - fast!)
+    # IMPORTANT: all_image_ids must only contain valid dataset indices.
+    # SAM3 outputs multiple queries per image, so we filter to unique valid IDs.
     print(f"\n[INFO] Creating ground truth from validation dataset...")
+    valid_image_ids = sorted(set(
+        img_id for img_id in all_image_ids if img_id < len(val_ds)
+    ))
+    print(f"[INFO] Using {len(valid_image_ids)} unique image IDs for GT (from {len(all_image_ids)} predictions)")
     coco_gt_dict = create_coco_gt_from_dataset(
         val_ds,
-        image_ids=all_image_ids,
+        image_ids=valid_image_ids,
         mask_resolution=288
     )
 

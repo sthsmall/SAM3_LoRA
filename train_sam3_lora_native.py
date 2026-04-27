@@ -139,12 +139,17 @@ class COCOSegmentDataset(Dataset):
                 self.img_to_anns[img_id] = []
             self.img_to_anns[img_id].append(ann)
 
-        # Load categories
-        self.categories = {cat['id']: cat['name'] for cat in self.coco_data['categories']}
+        # Load categories - use supercategory if available (matches training prompts)
+        self.categories = {}
+        self.category_names = {}
+        for cat in self.coco_data['categories']:
+            self.categories[cat['id']] = cat.get('supercategory', cat['name'])
+            self.category_names[cat['id']] = cat['name']
         print(f"Loaded COCO dataset: {split} split")
         print(f"  Images: {len(self.image_ids)}")
         print(f"  Annotations: {len(self.coco_data['annotations'])}")
-        print(f"  Categories: {self.categories}")
+        print(f"  Categories (supercategory used for prompts): {self.categories}")
+        print(f"  Category names (for reference): {self.category_names}")
 
         self.resolution = 1008
         self.transform = v2.Compose([
@@ -784,7 +789,8 @@ class SAM3TrainerNative:
         self.model = build_sam3_image_model(
             device=self.device.type,
             compile=False,
-            load_from_HF=True,  # Tries to download from HF if checkpoint_path is None
+            # load_from_HF=True,  # Tries to download from HF if checkpoint_path is None
+            checkpoint_path="/mnt/d/projects/specific/sam3/sam3/sam3.pt",
             bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
             eval_mode=False
         )

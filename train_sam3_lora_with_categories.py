@@ -45,14 +45,16 @@ class SAM3DatasetWithCategories(Dataset):
         with open(coco_file_path, 'r') as f:
             self.coco_data = json.load(f)
 
-        # Build category mapping: category_id -> category_name
-        self.categories = {
-            cat['id']: cat['name']
-            for cat in self.coco_data['categories']
-        }
+        # Build category mapping: category_id -> supercategory (if available)
+        self.categories = {}
+        self.category_names = {}
+        for cat in self.coco_data['categories']:
+            self.categories[cat['id']] = cat.get('supercategory', cat['name'])
+            self.category_names[cat['id']] = cat['name']
         print(f"📂 Loaded {len(self.categories)} categories:")
         for cat_id, cat_name in self.categories.items():
-            print(f"   - ID {cat_id}: '{cat_name}'")
+            detail = f" (from '{self.category_names[cat_id]}')" if self.category_names[cat_id] != cat_name else ""
+            print(f"   - ID {cat_id}: '{cat_name}'{detail}")
 
         # Build mapping: image_filename -> list of (bbox, mask, category_id)
         self.image_annotations = {}
@@ -220,7 +222,8 @@ class SAM3TrainerWithCategories:
         self.model = build_sam3_image_model(
             device=self.device.type,
             compile=False,
-            load_from_HF=True,
+            load_from_HF=False,
+            checkpoint_path="/path/to/your/local/sam3.pt",  # 你的本地路径
             bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz"
         )
 
