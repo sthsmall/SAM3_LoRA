@@ -8,7 +8,7 @@ model:
 
 # LoRA settings
 lora:
-  rank: 8                    # Rank of LoRA matrices (higher = more capacity, more parameters)
+  rank: 4                   # Rank of LoRA matrices (higher = more capacity, more parameters)
   alpha: 16                  # Scaling factor (typically 2x rank)
   dropout: 0.0               # Dropout for LoRA layers
 
@@ -30,9 +30,10 @@ lora:
 # Training settings
 training:
   # Data
-  train_data_path: "/workspace/sam3_lora/data/train"
-  val_data_path: "/workspace/sam3_lora/data/valid"
-  batch_size: 20
+  data_dir: "/mnt/d/projects/specific/SAM3_LoRA/data/airplane_coco_test"
+  train_data_path: "/mnt/d/projects/specific/SAM3_LoRA/data/airplane_coco_test/train"
+  val_data_path: "/mnt/d/projects/specific/SAM3_LoRA/data/airplane_coco_test/valid"
+  batch_size: 2
   num_workers: 4
 
   # Optimization
@@ -55,7 +56,7 @@ training:
   save_total_limit: 3        # Keep only best 3 checkpoints
 
   # Mixed precision
-  mixed_precision: "fp16"    # Options: no, fp16, bf16
+  mixed_precision: "bf16"    # Options: no, fp16, bf16
 
   # Other
   seed: 42

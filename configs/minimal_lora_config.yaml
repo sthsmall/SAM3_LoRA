@@ -29,9 +29,9 @@ lora:
 
 # Training settings
 training:
-  train_data_path: "data/train"
-  val_data_path: "data/val"
-  batch_size: 8              # Larger batch possible with fewer params
+  data_dir: "/mnt/d/projects/specific/SAM3_LoRA/data/airplane_coco_test"  
+  # val_data_path: "data/val"
+  batch_size: 2              # Larger batch possible with fewer params
   num_workers: 4
 
   learning_rate: 2e-4        # Higher LR for smaller model
@@ -41,7 +41,7 @@ training:
   adam_epsilon: 1e-8
   max_grad_norm: 1.0
 
-  num_epochs: 5              # Fewer epochs needed
+  num_epochs: 50              # Fewer epochs needed
   warmup_steps: 100
   lr_scheduler: "cosine"
 
