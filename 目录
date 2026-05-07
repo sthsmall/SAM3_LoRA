@@ -1,0 +1,28 @@
+SAM3_LoRA/
+├── ═══════════════ 核心文件（根目录）═══════════════
+│   ├── train_sam3_lora_native.py    ⭐ 训练脚本
+│   ├── validate_sam3_lora.py        📊 评估脚本
+│   ├── infer_sam.py                 🔍 推理脚本
+│   ├── merge_lora_to_base.py         🔗 LoRA 合并
+│   ├── merge_and_test.sh            🚀 一键合并+测试
+│   ├── lora_layers.py               🧬 LoRA 底层实现
+│   ├── requirements.txt             📦 依赖
+│   ├── setup.py                     ⚙️ 安装
+│   ├── bpe_simple_vocab_16e6.txt.gz 📖 词表
+│   ├── sam3_merged.pt / sam3_merged_video.pt 🎯 合并后模型
+│   ├── loral.yaml                   ⚙️ 额外配置
+│   └── Machinery.zip                📦 数据集
+│
+├── archive/              ← 旧训练/推理脚本（10个文件）
+├── tools/                ← 工具脚本（5个文件）
+├── tests/                ← 测试脚本（6个文件）
+├── comparison/           ← LoRA vs Base 对比（3个文件）
+├── demos/                ← 示例/demo（1个文件）
+├── doc/                  ← 文档（含 MOT_PURPOSE.md）
+├── configs/              ← 训练配置文件
+├── sam3/                 ← SAM3 源码
+├── src/                  ← 模块化 LoRA 代码
+├── sam3_lora/            ← 独立 LoRA 包
+├── data/                 ← 训练数据
+├── outputs/              ← 训练输出
+└── test_outputs/         ← 测试输出

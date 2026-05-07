@@ -798,6 +798,7 @@ class SAM3TrainerNative:
         # Apply LoRA
         print_rank0("Applying LoRA...")
         lora_cfg = self.config["lora"]
+        self.lora_config_dict = dict(lora_cfg)  # store for saving with checkpoint
         lora_config = LoRAConfig(
             rank=lora_cfg["rank"],
             alpha=lora_cfg["alpha"],
@@ -889,6 +890,25 @@ class SAM3TrainerNative:
             normalization="local",  # Use local normalization (no distributed training)
             normalize_by_valid_object_num=False,
         )
+
+        # Mixed precision setup
+        self.mixed_precision = self.config["training"].get("mixed_precision", "no")
+        self.scaler = None
+        if self.mixed_precision == "bf16":
+            if torch.cuda.is_bf16_supported():
+                self.amp_dtype = torch.bfloat16
+                print_rank0(f"Mixed precision: bf16 enabled")
+            else:
+                print_rank0(f"WARNING: bf16 not supported on this GPU, falling back to fp32")
+                self.mixed_precision = "no"
+                self.amp_dtype = torch.float32
+        elif self.mixed_precision == "fp16":
+            self.amp_dtype = torch.float16
+            self.scaler = torch.cuda.amp.GradScaler()
+            print_rank0(f"Mixed precision: fp16 enabled (with GradScaler)")
+        else:
+            self.amp_dtype = torch.float32
+            print_rank0(f"Mixed precision: disabled (fp32)")
         
     def train(self):
         # Get data directory from config (should point to directory containing train/valid folders)
@@ -1024,48 +1044,63 @@ class SAM3TrainerNative:
                 # Move to device
                 input_batch = move_to_device(input_batch, self.device)
 
-                # Forward pass
-                # outputs_list is SAM3Output, we need to pass the whole thing to loss_wrapper
-                outputs_list = self.model(input_batch)
+                # Forward pass with mixed precision
+                if self.mixed_precision != "no":
+                    with torch.amp.autocast('cuda', dtype=self.amp_dtype):
+                        outputs_list = self.model(input_batch)
 
-                # Prepare targets for loss
-                # input_batch.find_targets is a list of BatchedFindTarget (one per stage)
-                find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
+                        find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
+                        for targets in find_targets:
+                            for k, v in targets.items():
+                                if isinstance(v, torch.Tensor):
+                                    targets[k] = v.to(self.device)
 
-                # Move targets to device
-                for targets in find_targets:
-                    for k, v in targets.items():
-                        if isinstance(v, torch.Tensor):
-                            targets[k] = v.to(self.device)
+                        with SAM3Output.iteration_mode(
+                            outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
+                        ) as outputs_iter:
+                            for stage_outputs, stage_targets in zip(outputs_iter, find_targets):
+                                stage_targets_list = [stage_targets] * len(stage_outputs)
+                                for outputs, targets in zip(stage_outputs, stage_targets_list):
+                                    outputs["indices"] = self.matcher(outputs, targets)
+                                    if "aux_outputs" in outputs:
+                                        for aux_out in outputs["aux_outputs"]:
+                                            aux_out["indices"] = self.matcher(aux_out, targets)
 
-                # Add matcher indices to outputs (required by Sam3LossWrapper)
-                # Use SAM3Output.iteration_mode to properly iterate over outputs
-                with SAM3Output.iteration_mode(
-                    outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
-                ) as outputs_iter:
-                    for stage_outputs, stage_targets in zip(outputs_iter, find_targets):
-                        # stage_targets is a single target dict, replicate for all steps
-                        stage_targets_list = [stage_targets] * len(stage_outputs)
-                        for outputs, targets in zip(stage_outputs, stage_targets_list):
-                            # Compute indices for main output
-                            outputs["indices"] = self.matcher(outputs, targets)
+                        loss_dict = self.loss_wrapper(outputs_list, find_targets)
+                        total_loss = loss_dict[CORE_LOSS_KEY]
+                else:
+                    # Forward pass (fp32)
+                    outputs_list = self.model(input_batch)
 
-                            # Also add indices to auxiliary outputs if they exist
-                            if "aux_outputs" in outputs:
-                                for aux_out in outputs["aux_outputs"]:
-                                    aux_out["indices"] = self.matcher(aux_out, targets)
+                    find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
+                    for targets in find_targets:
+                        for k, v in targets.items():
+                            if isinstance(v, torch.Tensor):
+                                targets[k] = v.to(self.device)
 
-                # Compute loss using Sam3LossWrapper
-                # This handles num_boxes calculation and proper weighting
-                loss_dict = self.loss_wrapper(outputs_list, find_targets)
+                    with SAM3Output.iteration_mode(
+                        outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
+                    ) as outputs_iter:
+                        for stage_outputs, stage_targets in zip(outputs_iter, find_targets):
+                            stage_targets_list = [stage_targets] * len(stage_outputs)
+                            for outputs, targets in zip(stage_outputs, stage_targets_list):
+                                outputs["indices"] = self.matcher(outputs, targets)
+                                if "aux_outputs" in outputs:
+                                    for aux_out in outputs["aux_outputs"]:
+                                        aux_out["indices"] = self.matcher(aux_out, targets)
 
-                # Extract total loss
-                total_loss = loss_dict[CORE_LOSS_KEY]
+                    loss_dict = self.loss_wrapper(outputs_list, find_targets)
+                    total_loss = loss_dict[CORE_LOSS_KEY]
 
                 # Backward
                 self.optimizer.zero_grad()
-                total_loss.backward()
-                self.optimizer.step()
+                if self.mixed_precision == "fp16" and hasattr(self, 'scaler') and self.scaler is not None:
+                    self.scaler.scale(total_loss).backward()
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    total_loss.backward()
+                    self.optimizer.step()
 
                 # Track training loss
                 train_losses.append(total_loss.item())
@@ -1086,33 +1121,52 @@ class SAM3TrainerNative:
                         input_batch = batch_dict["input"]
                         input_batch = move_to_device(input_batch, self.device)
 
-                        # Forward pass
-                        outputs_list = self.model(input_batch)
+                        # Forward pass with mixed precision
+                        if self.mixed_precision != "no":
+                            with torch.amp.autocast('cuda', dtype=self.amp_dtype):
+                                outputs_list = self.model(input_batch)
 
-                        # Prepare targets
-                        find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
+                                find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
+                                for targets in find_targets:
+                                    for k, v in targets.items():
+                                        if isinstance(v, torch.Tensor):
+                                            targets[k] = v.to(self.device)
 
-                        # Move targets to device
-                        for targets in find_targets:
-                            for k, v in targets.items():
-                                if isinstance(v, torch.Tensor):
-                                    targets[k] = v.to(self.device)
+                                with SAM3Output.iteration_mode(
+                                    outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
+                                ) as outputs_iter:
+                                    for stage_outputs, stage_targets in zip(outputs_iter, find_targets):
+                                        stage_targets_list = [stage_targets] * len(stage_outputs)
+                                        for outputs, targets in zip(stage_outputs, stage_targets_list):
+                                            outputs["indices"] = self.matcher(outputs, targets)
+                                            if "aux_outputs" in outputs:
+                                                for aux_out in outputs["aux_outputs"]:
+                                                    aux_out["indices"] = self.matcher(aux_out, targets)
 
-                        # Add matcher indices to outputs (required by Sam3LossWrapper)
-                        with SAM3Output.iteration_mode(
-                            outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
-                        ) as outputs_iter:
-                            for stage_outputs, stage_targets in zip(outputs_iter, find_targets):
-                                stage_targets_list = [stage_targets] * len(stage_outputs)
-                                for outputs, targets in zip(stage_outputs, stage_targets_list):
-                                    outputs["indices"] = self.matcher(outputs, targets)
-                                    if "aux_outputs" in outputs:
-                                        for aux_out in outputs["aux_outputs"]:
-                                            aux_out["indices"] = self.matcher(aux_out, targets)
+                                loss_dict = self.loss_wrapper(outputs_list, find_targets)
+                                total_loss = loss_dict[CORE_LOSS_KEY]
+                        else:
+                            outputs_list = self.model(input_batch)
 
-                        # Compute loss using Sam3LossWrapper
-                        loss_dict = self.loss_wrapper(outputs_list, find_targets)
-                        total_loss = loss_dict[CORE_LOSS_KEY]
+                            find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
+                            for targets in find_targets:
+                                for k, v in targets.items():
+                                    if isinstance(v, torch.Tensor):
+                                        targets[k] = v.to(self.device)
+
+                            with SAM3Output.iteration_mode(
+                                outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
+                            ) as outputs_iter:
+                                for stage_outputs, stage_targets in zip(outputs_iter, find_targets):
+                                    stage_targets_list = [stage_targets] * len(stage_outputs)
+                                    for outputs, targets in zip(stage_outputs, stage_targets_list):
+                                        outputs["indices"] = self.matcher(outputs, targets)
+                                        if "aux_outputs" in outputs:
+                                            for aux_out in outputs["aux_outputs"]:
+                                                aux_out["indices"] = self.matcher(aux_out, targets)
+
+                            loss_dict = self.loss_wrapper(outputs_list, find_targets)
+                            total_loss = loss_dict[CORE_LOSS_KEY]
 
                         val_losses.append(total_loss.item())
                         val_pbar.set_postfix({"val_loss": total_loss.item()})
@@ -1131,11 +1185,11 @@ class SAM3TrainerNative:
                 if is_main_process():
                     # Get underlying model from DDP wrapper
                     model_to_save = self.model.module if self.multi_gpu else self.model
-                    save_lora_weights(model_to_save, str(out_dir / "last_lora_weights.pt"))
+                    save_lora_weights(model_to_save, str(out_dir / "last_lora_weights.pt"), self.lora_config_dict)
 
                     if avg_val_loss < best_val_loss:
                         best_val_loss = avg_val_loss
-                        save_lora_weights(model_to_save, str(out_dir / "best_lora_weights.pt"))
+                        save_lora_weights(model_to_save, str(out_dir / "best_lora_weights.pt"), self.lora_config_dict)
                         print(f"✓ New best model saved (val_loss: {avg_val_loss:.6f})")
 
                     # Log to file
@@ -1154,9 +1208,7 @@ class SAM3TrainerNative:
                 # No validation - just save model each epoch (only on rank 0)
                 if is_main_process():
                     model_to_save = self.model.module if self.multi_gpu else self.model
-                    save_lora_weights(model_to_save, str(out_dir / "last_lora_weights.pt"))
-
-        # Synchronize before final save
+                    save_lora_weights(model_to_save, str(out_dir / "last_lora_weights.pt"), self.lora_config_dict)
         if self.multi_gpu:
             dist.barrier()
 

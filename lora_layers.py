@@ -510,13 +510,15 @@ def count_parameters(model: nn.Module) -> Dict[str, int]:
     }
 
 
-def save_lora_weights(model: nn.Module, save_path: str):
+def save_lora_weights(model: nn.Module, save_path: str, lora_config: Optional[dict] = None):
     """
     Save only LoRA weights (not the full model).
 
     Args:
         model: Model with LoRA layers
         save_path: Path to save LoRA weights
+        lora_config: Optional LoRA config dict (rank, alpha, target_modules, apply_to_*, etc.)
+                     Stored alongside weights for self-describing checkpoints.
     """
     lora_state_dict = {}
     for name, module in model.named_modules():
@@ -524,18 +526,44 @@ def save_lora_weights(model: nn.Module, save_path: str):
             lora_state_dict[f"{name}.lora_A"] = module.lora_A
             lora_state_dict[f"{name}.lora_B"] = module.lora_B
 
-    torch.save(lora_state_dict, save_path)
+    if lora_config is not None:
+        checkpoint = {
+            "lora_state_dict": lora_state_dict,
+            "lora_config": lora_config,
+        }
+    else:
+        checkpoint = lora_state_dict
+
+    torch.save(checkpoint, save_path)
     print(f"Saved LoRA weights to {save_path}")
 
 
 def load_lora_weights(model: nn.Module, load_path: str):
     """
     Load LoRA weights into a model.
+    Supports both plain state_dict and checkpoint-with-config formats.
 
     Args:
         model: Model with LoRA layers
         load_path: Path to LoRA weights
     """
-    lora_state_dict = torch.load(load_path)
+    checkpoint = torch.load(load_path)
+    has_config_info = False
+    if isinstance(checkpoint, dict):
+        if "lora_state_dict" in checkpoint:
+            lora_state_dict = checkpoint["lora_state_dict"]
+            if "lora_config" in checkpoint:
+                has_config_info = True
+                print(f"Loaded LoRA weights from {load_path} (with config: rank={checkpoint['lora_config'].get('rank', '?')}, alpha={checkpoint['lora_config'].get('alpha', '?')})")
+        else:
+            has_lora_keys = any(".lora_A" in k or ".lora_B" in k for k in checkpoint.keys())
+            if has_lora_keys:
+                lora_state_dict = checkpoint
+            else:
+                lora_state_dict = checkpoint
+    else:
+        lora_state_dict = checkpoint
+
     model.load_state_dict(lora_state_dict, strict=False)
-    print(f"Loaded LoRA weights from {load_path}")
+    if not has_config_info:
+        print(f"Loaded LoRA weights from {load_path}")
